@@ -635,7 +635,7 @@ export default function CRM() {
   const [selectedContact, setSelectedContact] = useState(null);
   const [activeAgent, setActiveAgent] = useState(null);
   const [agentContext, setAgentContext] = useState(null);
-  const [apiKey, setApiKey] = useState("");
+  const [apiKey, setApiKey] = useState(import.meta.env.VITE_GROQ_API_KEY || localStorage.getItem("groq_api_key") || "");
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [keyInput, setKeyInput] = useState("");
   const [showContactForm, setShowContactForm] = useState(false);
@@ -723,13 +723,20 @@ export default function CRM() {
         </nav>
 
         <div style={{padding:"14px 10px",borderTop:"1px solid #0f1219"}}>
+          {!import.meta.env.VITE_GROQ_API_KEY && (
           <button onClick={()=>setShowKeyInput(!showKeyInput)} style={{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"8px 10px",borderRadius:8,border:`1px solid ${apiKey?"#10b98133":"#0f1219"}`,background:"transparent",cursor:"pointer",fontSize:11,color:apiKey?"#10b981":"#3a4456",fontWeight:500,transition:"all 0.15s"}}>
             <Ic n="key" s={12}/>{apiKey?"✓ API Key attiva":"Imposta API Key Groq"}
           </button>
+        )}
+        {import.meta.env.VITE_GROQ_API_KEY && (
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",fontSize:11,color:"#10b981"}}>
+            <Ic n="key" s={12}/>✓ API Key configurata
+          </div>
+        )}
           {showKeyInput&&(
             <div style={{marginTop:8,animation:"fadeIn 0.15s ease"}}>
               <input value={keyInput} onChange={e=>setKeyInput(e.target.value)} placeholder="gsk_..." style={{...inputStyle,marginBottom:6,fontSize:11}}/>
-              <button onClick={()=>{setApiKey(keyInput);setShowKeyInput(false);}} style={{...btnPrimary(),width:"100%",fontSize:11}}>Salva</button>
+              <button onClick={()=>{setApiKey(keyInput);localStorage.setItem("groq_api_key",keyInput);setShowKeyInput(false);}} style={{...btnPrimary(),width:"100%",fontSize:11}}>Salva</button>
             </div>
           )}
         </div>

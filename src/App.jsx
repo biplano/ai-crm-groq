@@ -22,81 +22,84 @@ Pianifichi campagne, segmenti clientela, ottimizzi funnel e analizzi performance
 Hai accesso ai dati delle campagne e dei segmenti. Rispondi in italiano, approccio data-driven.`,
 };
 
-const WEB_SEARCH_TOOL = {
-  type: "function",
-  function: {
-    name: "web_search",
-    description: "Cerca su internet informazioni aggiornate per risolvere problemi tecnici, trovare best practice di customer service, normative su fatturazione, o qualsiasi informazione utile per rispondere al ticket del cliente.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "La query di ricerca in italiano o inglese" }
-      },
-      required: ["query"]
-    }
-  }
-};
+// Genera query di ricerca intelligente dal messaggio utente
+async function generateSearchQuery(userMessage, context, apiKey) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",
+      messages: [{
+        role: "user",
+        content: `Dato questo messaggio di un operatore customer service: "${userMessage}"
+${context ? `Contesto ticket: ${JSON.stringify(context)}` : ""}
+Genera UNA sola query di ricerca Google in italiano (max 8 parole) per trovare informazioni utili a rispondere.
+Rispondi SOLO con la query, niente altro.`
+      }],
+      max_tokens: 50,
+      temperature: 0.3,
+    }),
+  });
+  const data = await res.json();
+  return data.choices[0].message.content.trim().replace(/['"]/g, "");
+}
 
+// Ricerca via DuckDuckGo Instant Answer API
 async function executeWebSearch(query) {
   try {
-    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&kl=it-it`);
     const data = await res.json();
     const results = [];
-    if (data.AbstractText) results.push(`${data.AbstractText} (fonte: ${data.AbstractURL})`);
+    if (data.AbstractText) results.push(`Fonte: ${data.AbstractSource}
+${data.AbstractText}`);
+    if (data.Answer) results.push(`Risposta diretta: ${data.Answer}`);
     if (data.RelatedTopics) {
-      data.RelatedTopics.slice(0, 4).forEach(t => { if (t.Text) results.push(`• ${t.Text}`); });
+      data.RelatedTopics.slice(0, 5).forEach(t => { if (t.Text) results.push(`• ${t.Text}`); });
     }
-    return results.length > 0 ? results.join("\n") : "Nessun risultato trovato per questa query.";
+    if (data.Results) {
+      data.Results.slice(0, 3).forEach(r => { if (r.Text) results.push(`• ${r.Text}`); });
+    }
+    return results.length > 0 ? results.join("\n") : null;
   } catch {
-    return "Ricerca non disponibile al momento.";
+    return null;
   }
 }
 
 async function callGroq(agentType, messages, apiKey) {
   const isCS = agentType === "customerService";
-  const body = {
-    model: GROQ_MODELS[agentType],
-    messages: [{ role: "system", content: AGENT_PROMPTS[agentType] }, ...messages],
-    max_tokens: 1024,
-    temperature: 0.7,
-  };
-  if (isCS) body.tools = [WEB_SEARCH_TOOL];
+  let searchedQuery = null;
+  let extraContext = "";
+
+  // Per il Customer Service: cerca sempre su internet prima di rispondere
+  if (isCS && messages.length > 0) {
+    const lastUserMsg = [...messages].reverse().find(m => m.role === "user");
+    if (lastUserMsg) {
+      try {
+        searchedQuery = await generateSearchQuery(lastUserMsg.content, null, apiKey);
+        const searchResult = await executeWebSearch(searchedQuery);
+        if (searchResult) {
+          extraContext = `\n\n[RISULTATI RICERCA WEB per "${searchedQuery}"]\n${searchResult}\n[Fine risultati web - usa queste informazioni per arricchire la tua risposta]`;
+        }
+      } catch { /* ricerca fallita, continua senza */ }
+    }
+  }
+
+  // Costruisci i messaggi con il contesto di ricerca iniettato nel system prompt
+  const systemMsg = { role: "system", content: AGENT_PROMPTS[agentType] + extraContext };
 
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: GROQ_MODELS[agentType],
+      messages: [systemMsg, ...messages],
+      max_tokens: 1024,
+      temperature: 0.7,
+    }),
   });
   if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || "Errore Groq"); }
   const data = await res.json();
-  const msg = data.choices[0].message;
-
-  if (msg.tool_calls && msg.tool_calls.length > 0) {
-    const toolCall = msg.tool_calls[0];
-    const args = JSON.parse(toolCall.function.arguments);
-    const searchResult = await executeWebSearch(args.query);
-
-    const followUp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: GROQ_MODELS[agentType],
-        messages: [
-          { role: "system", content: AGENT_PROMPTS[agentType] },
-          ...messages,
-          { role: "assistant", content: null, tool_calls: msg.tool_calls },
-          { role: "tool", tool_call_id: toolCall.id, content: searchResult },
-        ],
-        max_tokens: 1024,
-        temperature: 0.7,
-      }),
-    });
-    if (!followUp.ok) { const e = await followUp.json(); throw new Error(e.error?.message || "Errore Groq follow-up"); }
-    const followData = await followUp.json();
-    return { text: followData.choices[0].message.content, searched: args.query };
-  }
-
-  return { text: msg.content, searched: null };
+  return { text: data.choices[0].message.content, searched: searchedQuery };
 }
 
 

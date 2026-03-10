@@ -3,7 +3,7 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContai
 
 // ─── Groq API ──────────────────────────────────────────────────────────────────
 const GROQ_MODELS = {
-  customerService: "llama-3.1-8b-instant",
+  customerService: "llama-3.3-70b-versatile",
   sales: "llama-3.3-70b-versatile",
   marketing: "llama-3.3-70b-versatile",
 };
@@ -11,7 +11,9 @@ const GROQ_MODELS = {
 const AGENT_PROMPTS = {
   customerService: `Sei un agente AI specializzato nel Customer Service B2C.
 Aiuti gli operatori a gestire ticket clienti, suggerire risposte, classificare priorità e proporre escalation.
-Hai accesso al contesto del cliente selezionato. Rispondi in italiano, professionale e conciso.`,
+Hai accesso al contesto del cliente selezionato e puoi cercare su internet per trovare soluzioni aggiornate.
+Quando cerchi online, spiega brevemente cosa hai trovato e come si applica al caso specifico.
+Rispondi in italiano, professionale e conciso.`,
   sales: `Sei un agente AI per la Rete di Vendita B2C.
 Supporti i commerciali nell'analisi lead, follow-up, proposte e pipeline di vendita.
 Hai accesso al contesto del cliente e della pipeline. Rispondi in italiano, orientato ai risultati.`,
@@ -20,20 +22,83 @@ Pianifichi campagne, segmenti clientela, ottimizzi funnel e analizzi performance
 Hai accesso ai dati delle campagne e dei segmenti. Rispondi in italiano, approccio data-driven.`,
 };
 
+const WEB_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "Cerca su internet informazioni aggiornate per risolvere problemi tecnici, trovare best practice di customer service, normative su fatturazione, o qualsiasi informazione utile per rispondere al ticket del cliente.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "La query di ricerca in italiano o inglese" }
+      },
+      required: ["query"]
+    }
+  }
+};
+
+async function executeWebSearch(query) {
+  try {
+    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+    const data = await res.json();
+    const results = [];
+    if (data.AbstractText) results.push(`${data.AbstractText} (fonte: ${data.AbstractURL})`);
+    if (data.RelatedTopics) {
+      data.RelatedTopics.slice(0, 4).forEach(t => { if (t.Text) results.push(`• ${t.Text}`); });
+    }
+    return results.length > 0 ? results.join("\n") : "Nessun risultato trovato per questa query.";
+  } catch {
+    return "Ricerca non disponibile al momento.";
+  }
+}
+
 async function callGroq(agentType, messages, apiKey) {
+  const isCS = agentType === "customerService";
+  const body = {
+    model: GROQ_MODELS[agentType],
+    messages: [{ role: "system", content: AGENT_PROMPTS[agentType] }, ...messages],
+    max_tokens: 1024,
+    temperature: 0.7,
+  };
+  if (isCS) body.tools = [WEB_SEARCH_TOOL];
+
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: GROQ_MODELS[agentType],
-      messages: [{ role: "system", content: AGENT_PROMPTS[agentType] }, ...messages],
-      max_tokens: 1024, temperature: 0.7,
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message || "Errore Groq"); }
   const data = await res.json();
-  return data.choices[0].message.content;
+  const msg = data.choices[0].message;
+
+  if (msg.tool_calls && msg.tool_calls.length > 0) {
+    const toolCall = msg.tool_calls[0];
+    const args = JSON.parse(toolCall.function.arguments);
+    const searchResult = await executeWebSearch(args.query);
+
+    const followUp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: GROQ_MODELS[agentType],
+        messages: [
+          { role: "system", content: AGENT_PROMPTS[agentType] },
+          ...messages,
+          { role: "assistant", content: null, tool_calls: msg.tool_calls },
+          { role: "tool", tool_call_id: toolCall.id, content: searchResult },
+        ],
+        max_tokens: 1024,
+        temperature: 0.7,
+      }),
+    });
+    if (!followUp.ok) { const e = await followUp.json(); throw new Error(e.error?.message || "Errore Groq follow-up"); }
+    const followData = await followUp.json();
+    return { text: followData.choices[0].message.content, searched: args.query };
+  }
+
+  return { text: msg.content, searched: null };
 }
+
 
 // ─── Mock Data ─────────────────────────────────────────────────────────────────
 const initialContacts = [
@@ -155,14 +220,15 @@ function AgentChat({ agent, agentCfg, apiKey, context, onClose }) {
     setMessages(m => [...m, { role:"user", content:input }]);
     setInput(""); setLoading(true); setError("");
     try {
-      const reply = await callGroq(agent, [...messages.map((m,i)=>i===0?{...m,content:m.content+contextStr}:m), userMsg], apiKey);
-      setMessages(m => [...m, { role:"assistant", content:reply }]);
+      const result = await callGroq(agent, [...messages.map((m,i)=>i===0?{...m,content:m.content+contextStr}:m), userMsg], apiKey);
+      const { text, searched } = typeof result === "object" ? result : { text: result, searched: null };
+      setMessages(m => [...m, { role:"assistant", content:text, searched }]);
     } catch(e) { setError(e.message); }
     finally { setLoading(false); }
   };
 
   const suggestions = {
-    customerService:["Analizza questo ticket e suggerisci una risposta","Come gestisco questa escalation?","Qual è la priorità corretta?"],
+    customerService:["Analizza questo ticket e suggerisci una risposta","Cerca online le best practice per questo tipo di problema","Come gestisco questa escalation? Cerca esempi simili","Qual è la normativa vigente sulla fatturazione elettronica?"],
     sales:["Suggerisci una strategia di follow-up","Prepara uno script per la chiamata","Come posso aumentare il valore del deal?"],
     marketing:["Che segmento dovrei targetizzare?","Suggerisci oggetto email per questa campagna","Analizza le performance attuali"],
   };
@@ -196,14 +262,21 @@ function AgentChat({ agent, agentCfg, apiKey, context, onClose }) {
           </div>
         )}
         {messages.map((m,i)=>(
-          <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
-            {m.role==="assistant"&&<div style={{width:26,height:26,borderRadius:8,background:agentCfg.gradient,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginRight:8,alignSelf:"flex-end"}}>{agentCfg.emoji}</div>}
-            <div style={{maxWidth:"82%",padding:"10px 14px",borderRadius:m.role==="user"?"14px 14px 4px 14px":"14px 14px 14px 4px",background:m.role==="user"?agentCfg.accent:"#111520",color:m.role==="user"?"#fff":"#c8ccd8",fontSize:13,lineHeight:1.7,border:m.role==="assistant"?"1px solid #1a1f2e":"none",whiteSpace:"pre-wrap"}}>
-              {m.content}
+          <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",flexDirection:"column",alignItems:m.role==="user"?"flex-end":"flex-start"}}>
+            {m.searched&&(
+              <div style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:"#3b82f6",marginBottom:4,marginLeft:34,background:"#1d4ed811",border:"1px solid #1d4ed833",borderRadius:6,padding:"3px 8px",alignSelf:"flex-start"}}>
+                🔍 Cercato: <em>{m.searched}</em>
+              </div>
+            )}
+            <div style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",width:"100%"}}>
+              {m.role==="assistant"&&<div style={{width:26,height:26,borderRadius:8,background:agentCfg.gradient,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginRight:8,alignSelf:"flex-end"}}>{agentCfg.emoji}</div>}
+              <div style={{maxWidth:"82%",padding:"10px 14px",borderRadius:m.role==="user"?"14px 14px 4px 14px":"14px 14px 14px 4px",background:m.role==="user"?agentCfg.accent:"#111520",color:m.role==="user"?"#fff":"#c8ccd8",fontSize:13,lineHeight:1.7,border:m.role==="assistant"?"1px solid #1a1f2e":"none",whiteSpace:"pre-wrap"}}>
+                {m.content}
+              </div>
             </div>
           </div>
         ))}
-        {loading&&<div style={{display:"flex",gap:8,alignItems:"center",color:"#4a5568",fontSize:12}}><svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke={agentCfg.color} strokeWidth="2" style={{animation:"spin 1s linear infinite"}}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>Elaborazione...</div>}
+        {loading&&<div style={{display:"flex",gap:8,alignItems:"center",color:"#4a5568",fontSize:12}}><svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke={agentCfg.color} strokeWidth="2" style={{animation:"spin 1s linear infinite"}}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>Ricerca e analisi in corso...</div>}
         {error&&<div style={{background:"#2d1515",border:"1px solid #7f1d1d",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#f87171"}}>{error}</div>}
         <div ref={bottomRef}/>
       </div>

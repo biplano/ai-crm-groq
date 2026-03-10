@@ -3,9 +3,9 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContai
 
 // ─── Groq API ──────────────────────────────────────────────────────────────────
 const GROQ_MODELS = {
-  customerService: "llama3-8b-8192",
-  sales: "llama3-70b-8192",
-  marketing: "mixtral-8x7b-32768",
+  customerService: "llama-3.1-8b-instant",
+  sales: "llama-3.3-70b-versatile",
+  marketing: "llama-3.3-70b-versatile",
 };
 
 const AGENT_PROMPTS = {
